@@ -3,9 +3,6 @@
 ## Overview
 This guide documents the current JWT token lifecycle management in the iOS app, with different behaviors for guest vs authenticated users.
 
-**Last Updated**: January 2025
-**Current Status**: Implemented with persistent guest tokens
-
 ## Token Behavior by User Type
 
 ### Guest Users (Current Implementation)
@@ -31,7 +28,7 @@ This guide documents the current JWT token lifecycle management in the iOS app, 
 // Headers are set in processHairstyle and other API methods:
 if let token = authToken {
     request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-    
+
     // Add device ID header for guest users (required by backend for rate limiting)
     if isGuestUser {
         request.setValue(deviceID, forHTTPHeaderField: "X-Device-ID")
@@ -51,13 +48,13 @@ class AuthenticationManager: NSObject, ObservableObject {
     @Published var currentUser: User?
     @Published var authToken: String?
     private let apiService = APIService.shared
-    
+
     // Guest sign-in stores token in Keychain
     private func signInAsGuest() {
         Task {
             do {
                 let response = try await apiService.createGuestSession()
-                
+
                 await MainActor.run {
                     self.authToken = response.guestToken
                     self.apiService.setAuthToken(response.guestToken, isGuest: true)
@@ -68,7 +65,7 @@ class AuthenticationManager: NSObject, ObservableObject {
                         isGuest: true
                     )
                     self.isAuthenticated = true
-                    
+
                     // Store guest token in Keychain (PERSISTED)
                     KeychainHelper.shared.save(response.guestToken, forKey: "guest_token")
                 }
@@ -77,7 +74,7 @@ class AuthenticationManager: NSObject, ObservableObject {
             }
         }
     }
-    
+
     // Check existing auth on app launch
     func checkExistingAuth() {
         if let token = KeychainHelper.shared.load(forKey: "access_token") {
@@ -91,7 +88,7 @@ class AuthenticationManager: NSObject, ObservableObject {
             authToken = token
             apiService.setAuthToken(token, isGuest: false)
             isAuthenticated = true
-            
+
         } else if let guestToken = KeychainHelper.shared.load(forKey: "guest_token") {
             // Check if guest token is expired
             if JWTDecoder.isTokenExpired(guestToken) {
@@ -118,28 +115,28 @@ struct JWTDecoder {
     static func decode(_ token: String) -> [String: Any]? {
         let segments = token.split(separator: ".")
         guard segments.count == 3 else { return nil }
-        
+
         let payloadSegment = String(segments[1])
         let paddedPayload = padBase64String(payloadSegment)
-        
+
         guard let payloadData = Data(base64Encoded: paddedPayload) else { return nil }
         return try? JSONSerialization.jsonObject(with: payloadData) as? [String: Any]
     }
-    
+
     /// Checks if a JWT token is expired
     static func isTokenExpired(_ token: String) -> Bool {
         guard let claims = decode(token),
               let exp = claims["exp"] as? TimeInterval else {
             return true
         }
-        
+
         let expirationDate = Date(timeIntervalSince1970: exp)
         let now = Date()
-        
+
         // Add 5-minute buffer for clock skew
         let bufferTime: TimeInterval = 5 * 60
         let adjustedExpirationDate = expirationDate.addingTimeInterval(-bufferTime)
-        
+
         return now > adjustedExpirationDate
     }
 }
@@ -150,11 +147,11 @@ struct JWTDecoder {
 ```swift
 class APIService {
     static let shared = APIService()
-    
+
     private var authToken: String?
     private var isGuestUser: Bool = false
     private let deviceID: String
-    
+
     private init() {
         // Generate or retrieve persistent device ID
         if let savedDeviceID = UserDefaults.standard.string(forKey: "deviceID") {
@@ -165,12 +162,12 @@ class APIService {
             self.deviceID = newDeviceID
         }
     }
-    
+
     func setAuthToken(_ token: String?, isGuest: Bool = false) {
         self.authToken = token
         self.isGuestUser = isGuest
     }
-    
+
     func makeAuthenticatedRequest(
         endpoint: String,
         method: String = "POST",
@@ -187,24 +184,24 @@ class APIService {
             completion(.failure(APIError.authenticationRequired))
             return
         }
-        
+
         // Build request with required headers
         guard let url = URL(string: "\(GuestAuthService.baseURL)\(endpoint)") else {
             completion(.failure(APIError.invalidURL))
             return
         }
-        
+
         var request = URLRequest(url: url)
         request.httpMethod = method
         request.httpBody = body
-        
+
         // Set required headers
         let headers = APIHeaders.getHeaders(
             token: token,
             deviceID: AuthManager.shared.deviceID
         )
         headers.forEach { request.setValue($0.value, forHTTPHeaderField: $0.key) }
-        
+
         // Make request
         URLSession.shared.dataTask(with: request) { data, response, error in
             if let httpResponse = response as? HTTPURLResponse {
@@ -217,7 +214,7 @@ class APIService {
                         object: nil
                     )
                     completion(.failure(APIError.unauthorized))
-                    
+
                 case 400:
                     // Might be missing X-Device-ID
                     if let data = data,
@@ -227,12 +224,12 @@ class APIService {
                     } else {
                         completion(.failure(APIError.badRequest))
                     }
-                    
+
                 case 429:
                     // Rate limited
                     self.handleRateLimit(response: httpResponse, data: data)
                     completion(.failure(APIError.rateLimited))
-                    
+
                 case 200...299:
                     // Success
                     if let data = data {
@@ -240,7 +237,7 @@ class APIService {
                     } else {
                         completion(.failure(APIError.noData))
                     }
-                    
+
                 default:
                     completion(.failure(APIError.serverError(statusCode: httpResponse.statusCode)))
                 }
@@ -251,13 +248,13 @@ class APIService {
             }
         }.resume()
     }
-    
+
     private func handleRateLimit(response: HTTPURLResponse, data: Data?) {
         // Extract rate limit info
         let remaining = response.allHeaderFields["X-RateLimit-Remaining"] as? String
         let resetTime = response.allHeaderFields["X-RateLimit-Reset"] as? String
         let retryAfter = response.allHeaderFields["Retry-After"] as? String
-        
+
         // Notify UI about rate limit
         NotificationCenter.default.post(
             name: .rateLimitExceeded,
@@ -276,12 +273,12 @@ class APIService {
 
 ```swift
 class AppDelegate: UIResponder, UIApplicationDelegate {
-    
+
     func application(
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
     ) -> Bool {
-        
+
         // Check for existing session
         if AuthManager.shared.isTokenValid() {
             // Token still valid (app was in background, not closed)
@@ -290,10 +287,10 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
             // No valid token - show auth screen
             navigateToAuthScreen()
         }
-        
+
         return true
     }
-    
+
     func applicationWillTerminate(_ application: UIApplication) {
         // Guest tokens are automatically cleared (memory only)
         // No action needed
@@ -302,7 +299,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
 
 // SceneDelegate for iOS 13+
 class SceneDelegate: UIResponder, UIWindowSceneDelegate {
-    
+
     func sceneDidBecomeActive(_ scene: UIScene) {
         // Check token validity when app becomes active
         if !AuthManager.shared.isTokenValid() {
@@ -316,10 +313,10 @@ class SceneDelegate: UIResponder, UIWindowSceneDelegate {
 
 ```swift
 class MainViewController: UIViewController {
-    
+
     override func viewDidLoad() {
         super.viewDidLoad()
-        
+
         // Listen for auth events
         NotificationCenter.default.addObserver(
             self,
@@ -327,7 +324,7 @@ class MainViewController: UIViewController {
             name: .authenticationRequired,
             object: nil
         )
-        
+
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(handleRateLimit),
@@ -335,7 +332,7 @@ class MainViewController: UIViewController {
             object: nil
         )
     }
-    
+
     @objc private func handleAuthRequired() {
         DispatchQueue.main.async {
             // Show auth screen
@@ -344,23 +341,23 @@ class MainViewController: UIViewController {
             self.present(authVC, animated: true)
         }
     }
-    
+
     @objc private func handleRateLimit(_ notification: Notification) {
         guard let userInfo = notification.userInfo,
               let retryAfter = userInfo["retryAfter"] as? String,
               let seconds = Int(retryAfter) else { return }
-        
+
         DispatchQueue.main.async {
             let hours = seconds / 3600
             let minutes = (seconds % 3600) / 60
-            
+
             var message = "You've reached your daily limit of 5 hairstyle edits."
             if hours > 0 {
                 message += " Try again in \(hours) hour\(hours > 1 ? "s" : "")."
             } else if minutes > 0 {
                 message += " Try again in \(minutes) minute\(minutes > 1 ? "s" : "")."
             }
-            
+
             let alert = UIAlertController(
                 title: "Daily Limit Reached",
                 message: message,
@@ -386,7 +383,7 @@ enum APIError: Error {
     case noData
     case invalidURL
     case unknown
-    
+
     var localizedDescription: String {
         switch self {
         case .authenticationRequired:
