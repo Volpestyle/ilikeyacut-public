@@ -9,7 +9,7 @@ Key goals:
 - Three equal ways to choose hairstyles: text description, source image, or library selection
 - Native mobile stacks with SwiftUI/SceneKit for iOS and Jetpack Compose/Filament for Android for performance
 - Serverless backend: AWS Lambda, S3, Cognito, DynamoDB
-- Fluid and snappy UI response with platform-specific animations (SwiftUI for iOS, Compose animations for Android)
+- Fluid and snappy UI response with platform-specific animations (SwiftUI for iOS, Compose animations for Android). Clean, sleek, and modern dark mode design. Geist font.
 - Secure AI processing through Lambda proxy to protect API keys
 - Dynamic hairstyle template library fetched from DynamoDB for easy maintenance without app redeploys
 - Scalable storage of hairstyle template assets (e.g., reference images) in S3 for dynamic, visual library enhancements
@@ -51,7 +51,6 @@ Key goals:
         )
         ```
     - **AI Processing Pipeline**:
-      - Images resized to 1024x1024 using platform-specific graphics APIs (UIGraphicsImageRenderer for iOS, Bitmap for Android)
       - Request sent to `/gemini-edit` Lambda endpoint with multipart data
       - Lambda adds API key from Secrets Manager and forwards to Gemini API
       - Gemini's built-in face preservation maintains identity without explicit masking
@@ -67,10 +66,6 @@ Key goals:
       - **Multi-Angle Mode**: Request specific views in prompt:
         ```swift
         // iOS Example
-        "Generate four views: front facing, left profile, right profile, and back view"
-        ```
-        ```kotlin
-        // Android Example
         "Generate four views: front facing, left profile, right profile, and back view"
         ```
     - **Iterative Refinement**:
@@ -98,8 +93,10 @@ Key goals:
 ## Look and Feel
 The app adopts a dark mode theme throughout, featuring a minimalistic design with subtle character to engage users without overwhelming them. Inspired by sleek designs from xAI, Tesla, and Apple. The overall aesthetic is clean, modern, and classy, using mostly white text and accents on a black background for high contrast and readability.
 - **Auth Entry Screen**: A fun, interactive 3D animation greets users on the onboarding screen for sign-in or guest mode. We leverage SceneKit for iOS and Filament for Android for 3D rendering.
-  The shears can rotate based on touch gestures using platform-specific gesture recognizers. Upon selecting to proceed, they animate a cutting motion and fly off screen with physics-based animation using SCNAction (iOS) or Filament's animation APIs (Android).
+  The shears can rotate based on touch gestures, with interaction similar to a trackball or spinning a globe, using platform-specific gesture recognizers. Upon selecting to proceed, they animate a cutting motion and fly off screen with physics-based animation using SCNAction (iOS) or Filament's animation APIs (Android).
 - **General UI Elements**: Minimalist layouts with ample negative space, rounded corners, and subtle shadows for depth. Transitions between screens use platform-specific transitions for smooth fades or slides. Interactive elements like buttons and sliders have micro-animations (e.g., scale on tap) using SwiftUI .animation modifiers (iOS) or Compose Animations (Android) to add character while maintaining fast response times.
+
+
 
 ## Tech Stack
 ### Native Mobile
@@ -161,15 +158,9 @@ val generatedImageData = result.candidates.firstOrNull()?.content?.parts?.firstO
 - **Input limitations**: Works best with up to 3 images as input
 **Three Input Methods Implementation**:
 1. **Text-Only Prompts**:
-```swift
-// iOS Direct text description with preservation instructions
-let prompt = "Transform the hairstyle to a classic bob cut with auburn highlights, " +
-             "while preserving the person's face and identity completely unchanged. " +
-             "Photorealistic style with soft studio lighting."
 ```
-```kotlin
-// Android Direct text description with preservation instructions
-val prompt = "Transform the hairstyle to a classic bob cut with auburn highlights, " +
+// Direct text description with preservation instructions
+let prompt = "Transform the hairstyle to a classic bob cut with auburn highlights, " +
              "while preserving the person's face and identity completely unchanged. " +
              "Photorealistic style with soft studio lighting."
 ```
@@ -196,11 +187,8 @@ val contents: List<GenerationContent.Part> = listOf(
 - Cached locally for fast UI response
 - Dynamic updates without app redeployment
 **Performance Optimization**:
-- **Image Preprocessing**: Resize to 1024x1024 for optimal quality/speed balance
 - **Caching Strategy**: Use SHA-256 hash of (image+prompt) as cache key
 - **Request Batching**: Support for generating multiple variations in single request
-- **Progressive Loading**: Stream partial results when available
-- **Error Handling**: Implement exponential backoff for rate limits (429 errors)
 **Backend Proxy Architecture**:
 ```go
 // Go Lambda handler for secure Gemini forwarding
@@ -271,12 +259,10 @@ We can save most user meta data to local storage. We mainly need a backend for o
 ```swift
 // iOS (Swift) - Background Queue
 func processHairstyle(userImage: Data, options: EditOptions) async throws -> [Data] {
-  // 1. Resize image for optimal performance
-  let resizedImage = try await resizeImage(userImage, width: 1024, height: 1024)
-  // 2. Construct multimodal content based on input method
+  // Construct multimodal content based on input method
   var contents: [GenerationContent.Part] = []
   // Always include base image
-  contents.append(.data(mimetype: "image/jpeg", data: resizedImage))
+  contents.append(.data(mimetype: "image/jpeg", data: userImage))
   // Add reference image if provided
   if let referenceImage = options.referenceImage {
     contents.append(.data(mimetype: "image/jpeg", data: referenceImage))
@@ -301,12 +287,10 @@ func processHairstyle(userImage: Data, options: EditOptions) async throws -> [Da
 ```kotlin
 // Android (Kotlin) - Coroutine
 suspend fun processHairstyle(userImage: ByteArray, options: EditOptions): List<ByteArray> {
-  // 1. Resize image for optimal performance
-  val resizedImage = resizeImage(userImage, 1024, 1024)
-  // 2. Construct multimodal content based on input method
+  // Construct multimodal content based on input method
   val contents = mutableListOf<GenerationContent.Part>()
   // Always include base image
-  contents.add(GenerationContent.Part.data("image/jpeg", resizedImage))
+  contents.add(GenerationContent.Part.data("image/jpeg", userImage))
   // Add reference image if provided
   options.referenceImage?.let {
     contents.add(GenerationContent.Part.data("image/jpeg", it))
