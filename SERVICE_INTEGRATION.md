@@ -10,38 +10,45 @@ This document describes how the iOS frontend and AWS serverless backend services
 ├─────────────────────────────────────────────────────────────┤
 │  Authentication  │  Camera/Photos  │  Hairstyle Editor      │
 │     Manager      │     Manager      │      Service          │
+│                  │                 │                        │
+│  Credit Manager  │  StoreKit IAP   │  Usage History         │
 └────────┬─────────┴────────┬─────────┴──────────┬────────────┘
          │                  │                     │
          │              Local Storage             │
-         │            (Keychain, Cache)           │
+         │         (Keychain, Cache, Credits)    │
          │                  │                     │
     ═════╪══════════════════╪═════════════════════╪═════════
          │              HTTPS/JSON                │
          │                  │                     │
 ┌────────▼──────────────────▼─────────────────────▼────────────┐
 │                    AWS API Gateway                            │
-│                  (Rate Limiting, CORS)                        │
+│            (Global Rate Limiting, Usage Plans)                │
 └────────┬──────────────────┬─────────────────────┬────────────┘
          │                  │                     │
 ┌────────▼────────┐ ┌───────▼────────┐ ┌─────────▼────────────┐
 │ Auth Lambda (Go)│ │Hairstyles      │ │ Gemini Proxy        │
 │ /api/auth/*     │ │Lambda (Go)     │ │ Lambda (Go)         │
 │                 │ │/api/hairstyles │ │ /api/gemini-edit    │
+│                 │ │                │ │ + Credit Validation │
 └────────┬────────┘ └───────┬────────┘ └─────────┬────────────┘
          │                  │                     │
-         │          ┌───────▼────────┐   ┌───────▼────────────┐
-         │          │   DynamoDB     │   │  Secrets Manager   │
-         │          │  (Templates)   │   │  (API Keys)        │
-         │          └───────┬────────┘   └────────────────────┘
-         │                  │                     │
-         │          ┌───────▼────────┐   ┌───────▼────────────┐
-         │          │   S3 Bucket    │   │  Google Gemini     │
-         │          │ (Asset Storage)│   │  2.5 Flash Image   │
-         │          └────────────────┘   └────────────────────┘
+     ┌───▼─────┐    ┌───────▼────────┐   ┌───────▼────────────┐
+     │Purchase │    │   DynamoDB     │   │  Secrets Manager   │
+     │Lambda   │    │  Tables:       │   │  (API Keys)        │
+     │/api/    │    │  - Templates   │   └────────────────────┘
+     │purchase │    │  - Users       │           │
+     └───┬─────┘    │  - Credits     │   ┌───────▼────────────┐
+         │          │  - History     │   │  Google Gemini     │
+         │          └───────┬────────┘   │  2.5 Flash Image   │
+         │                  │             │  ($0.039/image)    │
+         │          ┌───────▼────────┐   └────────────────────┘
+         │          │   S3 Bucket    │
+         │          │ (Asset Storage)│
+         │          └────────────────┘
          │
 ┌────────▼────────────────────────────────────────────────────┐
-│                    Amazon Cognito                           │
-│                  (User Authentication)                      │
+│            OAuth Providers (Google, X)                       │
+│                  + Device ID Tracking                        │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -52,13 +59,14 @@ This document describes how the iOS frontend and AWS serverless backend services
 #### 1. **AuthenticationManager** (`/ilikeyacut-ios/ilikeyacut/Services/AuthenticationManager.swift`)
 - **Purpose**: Manages user authentication state and OAuth flows
 - **Integration Points**:
-  - Calls `/api/auth/login` for OAuth authentication
-  - Calls `/api/auth/guest` for guest sessions
+  - Calls `/api/auth/login` for OAuth authentication (allocates 4 lifetime credits for new users)
+  - Calls `/api/auth/guest` for guest sessions (1 lifetime credit, device ID tracked)
   - Stores tokens in iOS Keychain
   - Includes auth token in all API requests
+  - Tracks user tier (guest/free/premium/admin)
 - **Data Flow**:
-  1. User initiates login → OAuth flow → Backend validates
-  2. Backend returns JWT token → Store in Keychain
+  1. Guest: Device ID → Backend tracks → 1 lifetime credit
+  2. OAuth: Login → Backend validates → 4 lifetime credits (first time)
   3. Token included in `Authorization` header for all requests
 
 #### 2. **APIService** (`/ilikeyacut-ios/ilikeyacut/Services/APIService.swift`)
@@ -76,15 +84,18 @@ This document describes how the iOS frontend and AWS serverless backend services
   ```
 
 #### 3. **HairstyleService** (`/ilikeyacut-ios/ilikeyacut/Services/HairstyleService.swift`)
-- **Purpose**: Manages hairstyle templates and AI processing
+- **Purpose**: Manages hairstyle templates and AI processing with credit validation
 - **Integration Points**:
-  - Fetches templates from `/api/hairstyles`
-  - Sends images to `/api/gemini-edit`
+  - Fetches templates from `/api/hairstyles` (includes S3 signed URLs)
+  - Sends images to `/api/gemini-edit` (validates credits first)
   - Caches templates locally (1-hour TTL)
+  - Handles 402 insufficient credits errors
 - **Data Flow**:
-  1. App launch → Fetch templates → Cache locally
-  2. User selects input method → Prepare multimodal request
-  3. Send to backend → Display results → Cache for history
+  1. App launch → Fetch templates with S3 assets → Cache locally
+  2. User selects input method → Check credit balance
+  3. If sufficient credits → Send to backend → Deduct credits
+  4. If insufficient → Show upgrade options (subscription/bundles)
+  5. Display results → Update credit UI → Cache for history
 
 #### 4. **CameraManager** (`/ilikeyacut-ios/ilikeyacut/Services/CameraManager.swift`)
 - **Purpose**: Handles camera and photo library operations
@@ -93,18 +104,45 @@ This document describes how the iOS frontend and AWS serverless backend services
   - Saves results to device gallery
   - No direct backend communication
 
+#### 5. **CreditManager** (`/ilikeyacut-ios/ilikeyacut/Services/CreditManager.swift`)
+- **Purpose**: Manages user credit balance and purchases
+- **Integration Points**:
+  - Fetches balance from `/api/user/credits`
+  - Validates credit availability before generation
+  - Handles StoreKit 2 purchases
+  - Calls `/api/purchase` for receipt validation
+- **Credit Requirements**:
+  - Single-image generation: 1 credit
+  - Multi-angle generation: 4 credits
+
+#### 6. **StoreKitManager** (`/ilikeyacut-ios/ilikeyacut/Services/StoreKitManager.swift`)
+- **Purpose**: Handles in-app purchases and subscriptions
+- **Product IDs**:
+  - `com.ilikeyacut.subscription.monthly` - $9.99 (168 credits/month)
+  - `com.ilikeyacut.bundle.small` - $0.99 (8 credits)
+  - `com.ilikeyacut.bundle.large` - $4.99 (48 credits)
+- **Integration**:
+  - StoreKit 2 for purchase flow
+  - Send receipt to `/api/purchase` for validation
+  - Update credit balance on success
+
 ### AWS Backend Services
 
 #### 1. **Gemini Proxy Lambda** (`/backend/lambda/gemini-proxy/main.go`)
 - **Endpoint**: `POST /api/gemini-edit`
-- **Purpose**: Secure proxy for Google Gemini API
+- **Purpose**: Secure proxy for Google Gemini API with credit management
 - **Flow**:
   1. Receive multimodal request from iOS app
-  2. Retrieve Gemini API key from Secrets Manager
-  3. Add face preservation instructions to prompt
-  4. Forward to Gemini 2.5 Flash Image API
-  5. Return generated images to client
-- **Security**: API key never exposed to client
+  2. Extract user ID from JWT or device ID for guests
+  3. Check credit balance (1 for single, 4 for multi-angle)
+  4. If insufficient → Return 402 with upgrade options
+  5. Deduct credits atomically from DynamoDB
+  6. Retrieve Gemini API key from Secrets Manager
+  7. Add face preservation instructions to prompt
+  8. Forward to Gemini 2.5 Flash Image API ($0.039/image)
+  9. Log usage to DynamoDB History table
+  10. Return generated images with remaining credits
+- **Headers**: Returns `X-Credits-Remaining` in response
 
 #### 2. **Hairstyles Lambda** (`/backend/lambda/hairstyles/main.go`)
 - **Endpoint**: `GET /api/hairstyles`
@@ -117,10 +155,29 @@ This document describes how the iOS frontend and AWS serverless backend services
 
 #### 3. **Auth Lambdas** (`/backend/lambda/auth/*.go`)
 - **Endpoints**: 
-  - `POST /api/auth/login` - OAuth authentication
-  - `POST /api/auth/guest` - Guest sessions
-- **Purpose**: Handle authentication flows
-- **Integration**: Cognito User Pools for user management
+  - `POST /api/auth/login` - OAuth authentication (4 lifetime credits for new users)
+  - `POST /api/auth/guest` - Guest sessions (1 lifetime credit, device tracked)
+- **Purpose**: Handle authentication and initial credit allocation
+- **Integration**: 
+  - OAuth providers (Google, X) for authentication
+  - DynamoDB Users table for user data
+  - DynamoDB Credits table for credit tracking
+
+#### 4. **Credit Management Lambdas** (`/backend/lambda/credits/*.go`)
+- **Endpoints**:
+  - `GET /api/user/credits` - Get current balance
+  - `POST /api/purchase` - Validate IAP and add credits
+  - `GET /api/usage-history` - Get generation history
+- **Purpose**: Manage credit system and purchases
+- **DynamoDB Tables**:
+  - **Users**: User profiles and tiers
+  - **Credits**: Credit balances and limits
+  - **History**: Usage tracking and analytics
+- **Credit Allocations**:
+  - Guest: 1 lifetime (device ID tracked)
+  - Free: 4 lifetime (OAuth required)
+  - Premium: 168/month (resets on billing date)
+  - Bundles: Added to balance (no expiration)
 
 ## Data Flow Scenarios
 
@@ -128,13 +185,28 @@ This document describes how the iOS frontend and AWS serverless backend services
 ```
 1. iOS: Camera captures photo → Compress to 1024x1024
 2. iOS: User selects hairstyle template from library
-3. iOS: APIService.processHairstyle() called
-4. API Gateway: Rate limit check → Route to Lambda
-5. Lambda: Add API key → Call Gemini API
-6. Gemini: Process image → Return transformed result
-7. Lambda: Log usage → Return to client
-8. iOS: Display result → Save to cache
-9. iOS: User saves → Store in Photos library
+3. iOS: Check credit balance (1 for single, 4 for multi-angle)
+4. iOS: If insufficient → Show purchase options (subscription/bundles)
+5. iOS: APIService.processHairstyle() called with auth token
+6. API Gateway: Global rate limit check → Route to Lambda
+7. Lambda: Validate user credits in DynamoDB
+8. Lambda: Deduct credits atomically (prevent race conditions)
+9. Lambda: Add API key → Call Gemini API ($0.039/image)
+10. Gemini: Process image → Return transformed result
+11. Lambda: Log to History table → Return with credits remaining
+12. iOS: Display result → Update credit UI → Save to cache
+13. iOS: User saves → Store in Photos library
+```
+
+### Scenario 3: User Purchases Credits
+```
+1. iOS: User taps purchase → StoreKit 2 sheet appears
+2. iOS: User completes purchase → Get receipt
+3. iOS: Send receipt to /api/purchase for validation
+4. Lambda: Verify with Apple/Google servers
+5. Lambda: Add credits to user balance in DynamoDB
+6. Lambda: Return new balance to client
+7. iOS: Update credit UI → Enable generation
 ```
 
 ### Scenario 2: Template Library Synchronization
@@ -166,6 +238,14 @@ let apiBaseURL = "https://api.ilikeyacut.app"
 Environment: dev|staging|prod
 GeminiApiKey: stored in Secrets Manager
 JWTSecret: stored in Secrets Manager
+AppleSharedSecret: stored in Secrets Manager (for IAP validation)
+GooglePlayKey: stored in Secrets Manager (for IAP validation)
+
+# DynamoDB Table Names
+UsersTable: ilikeyacut-users-{Environment}
+CreditsTable: ilikeyacut-credits-{Environment}
+HistoryTable: ilikeyacut-history-{Environment}
+TemplatesTable: ilikeyacut-templates-{Environment}
 ```
 
 ## Security Considerations
@@ -174,14 +254,20 @@ JWTSecret: stored in Secrets Manager
 - **HTTPS Only**: All communication encrypted
 - **API Keys**: Stored in AWS Secrets Manager, never in code
 - **JWT Tokens**: Short-lived (1 hour), refresh tokens for extended sessions
-- **Rate Limiting**: 60 req/min per IP, 1000 req/day per user
+- **Credit System**: Pre-flight validation prevents abuse
+- **Device Tracking**: Guest users tracked by device ID to prevent abuse
+- **Rate Limiting**: 
+  - Global: 60 req/sec burst, 100K req/day quota
+  - Credit-based: Guest (1), Free (4), Premium (168/month)
 - **CORS**: Configured for mobile app bundle IDs only
 
 ### Data Privacy
 - **Images**: Processed in memory, not stored on backend
 - **User Data**: Minimal collection, GDPR compliant
+- **Device IDs**: Used only for guest credit tracking
+- **Purchase Data**: Receipt validation only, no payment info stored
 - **Logs**: PII scrubbed, 7-day retention
-- **S3 Assets**: Private bucket with signed URL access only
+- **S3 Assets**: Private bucket with signed URL access only (1-hour expiry)
 
 ## Monitoring & Debugging
 
@@ -219,6 +305,30 @@ Failure: Show user-friendly error with retry option
 
 ### Backend Error Responses
 ```json
+// 402 - Insufficient Credits
+{
+  "error": {
+    "code": "insufficient_credits",
+    "message": "You need 4 credits for multi-angle generation. You have 2 credits."
+  },
+  "credits": {
+    "required": 4,
+    "available": 2,
+    "userType": "free"
+  },
+  "upgrade_options": {
+    "subscription": {
+      "credits_per_month": 168,
+      "price": "$9.99/month"
+    },
+    "bundles": [
+      { "credits": 8, "price": "$0.99" },
+      { "credits": 48, "price": "$4.99" }
+    ]
+  }
+}
+
+// 429 - Rate Limit
 {
   "error": {
     "code": "RATE_LIMIT_EXCEEDED",
@@ -262,6 +372,10 @@ Failure: Show user-friendly error with retry option
 
 # Verify deployment
 curl https://dev-api.ilikeyacut.app/api/hairstyles
+
+# Set admin access for development
+cd backend/scripts
+go run update-user-tier.go -email admin@example.com -tier admin
 ```
 
 ## Troubleshooting Guide
@@ -274,65 +388,84 @@ curl https://dev-api.ilikeyacut.app/api/hairstyles
 - Check: Valid auth token
 - Solution: Pull to refresh, re-login if needed
 
-#### 2. "Rate Limit Exceeded"
-- Cause: Too many requests
-- Solution: Wait 60 seconds, implement request batching
+#### 2. "Insufficient Credits"
+- Cause: User has exhausted credit allocation
+- Solution: Purchase subscription ($9.99/month) or bundle ($0.99/$4.99)
+- Dev: Set admin tier for unlimited credits
 
-#### 3. "Image Processing Failed"
-- Check: Image size (<20MB)
+#### 3. "Rate Limit Exceeded"
+- Cause: Global API limit reached (60 req/sec)
+- Solution: Wait and retry with exponential backoff
+
+#### 4. "Image Processing Failed"
+- Check: Image size (<20MB after base64)
 - Check: Valid image format (JPEG/PNG)
+- Check: Sufficient credits (1 or 4)
 - Check: Gemini API status
-- Solution: Compress image, retry with smaller size
+- Solution: Compress to 1024x1024, ensure credits available
 
-#### 4. "Templates Not Loading"
-- Check: DynamoDB table exists
+#### 5. "Templates Not Loading"
+- Check: DynamoDB Templates table exists
 - Check: S3 bucket accessible
-- Check: Lambda has proper IAM permissions
-- Solution: Run seed script, check AWS console
+- Check: Lambda has IAM permissions for S3 signed URLs
+- Solution: Run seed script, verify IAM roles
 
 ## Testing Strategy
 
 ### iOS Testing
 ```swift
 // Unit Tests
-- AuthenticationManager: Mock OAuth flows
-- APIService: Mock network responses
-- HairstyleService: Test caching logic
+- AuthenticationManager: Mock OAuth flows, device ID tracking
+- APIService: Mock network responses, 402 error handling
+- CreditManager: Test balance updates, purchase flows
+- HairstyleService: Test caching, credit validation
+- StoreKitManager: Mock IAP transactions
 
 // UI Tests
-- Camera flow: Capture → Preview → Save
-- Template selection: Browse → Select → Apply
-- Results: Display → Zoom → Share
+- Guest flow: Launch → 1 credit → Generate → Upgrade prompt
+- Purchase flow: Tap buy → StoreKit sheet → Success → Credits updated
+- Camera flow: Capture → Preview → Check credits → Generate
+- Template selection: Browse → Select → Validate credits → Apply
+- Results: Display → Zoom → Share → Update history
 ```
 
 ### Backend Testing
 ```go
 // Lambda Tests
-- Input validation
-- Error handling
+- Credit validation and deduction
+- Atomic DynamoDB operations
+- IAP receipt validation
+- 402 error response format
+- Device ID tracking for guests
 - Secrets Manager integration
-- DynamoDB queries
-- S3 signed URL generation
+- S3 signed URL generation (1-hour expiry)
+- Usage history logging
 ```
 
 ### Integration Testing
 ```bash
 # End-to-end test script
-1. Authenticate user
-2. Fetch templates
-3. Process test image
-4. Verify result
-5. Submit feedback
+1. Guest mode: Get 1 credit
+2. Attempt generation → Success
+3. Attempt second → 402 error
+4. OAuth login → Get 4 credits
+5. Multi-angle generation → 4 credits deducted
+6. Purchase bundle → Credits added
+7. Verify history tracking
+8. Test subscription flow
 ```
 
 ## Future Enhancements
 
 ### Planned Features
-1. **Batch Processing**: Multiple variations in single request
-2. **WebSocket Support**: Real-time progress updates
-3. **Offline Mode**: Queue requests when offline
-4. **Analytics**: Usage tracking, popular styles
-5. **Social Features**: Share transformations, user galleries
+1. **Annual Subscriptions**: $99/year option (20% discount)
+2. **Referral Program**: 5 credits per successful referral
+3. **Team Plans**: Corporate subscriptions for salons
+4. **Batch Processing**: Optimize multi-angle generation costs
+5. **WebSocket Support**: Real-time progress updates
+6. **Offline Mode**: Queue requests when offline
+7. **Analytics Dashboard**: Usage patterns, popular styles
+8. **Social Features**: Share transformations, user galleries
 
 ### Scalability Considerations
 - **Database**: Consider migrating to Aurora Serverless for high traffic
@@ -343,17 +476,24 @@ curl https://dev-api.ilikeyacut.app/api/hairstyles
 ## Support & Maintenance
 
 ### Monitoring Checklist
+- [ ] Credit usage patterns (daily)
+- [ ] IAP success rates (daily)
+- [ ] 402 error frequency (indicates upgrade opportunities)
 - [ ] API Gateway metrics (daily)
 - [ ] Lambda error rates (hourly during peak)
 - [ ] DynamoDB throttling (weekly)
+- [ ] Gemini API costs ($0.039/image tracking)
 - [ ] S3 storage costs (monthly)
 - [ ] Secrets rotation (quarterly)
 
 ### Update Process
 1. Backend: Deploy with SAM (zero downtime)
 2. iOS: Submit to App Store (1-2 day review)
+   - Include IAP products in App Store Connect
+   - Test with Sandbox accounts first
 3. Templates: Update via DynamoDB console (instant)
 4. Assets: Upload to S3, update DynamoDB references
+5. Credit Adjustments: Use admin scripts for user tier changes
 
 ## Contact & Resources
 

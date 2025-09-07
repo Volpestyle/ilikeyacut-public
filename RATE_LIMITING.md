@@ -1,36 +1,90 @@
-# Rate Limiting System
+# Rate Limiting & Credit System
 
-## User Tiers
+## Overview
 
-The application implements a tiered rate limiting system with the following limits:
+The application uses a **credit-based access system** where all users have access to the same features, but are limited by their available credits. Each image generation request consumes credits.
 
-| Tier | Daily Limit | Description | How to Upgrade |
-|------|-------------|-------------|----------------|
-| Guest | 3 requests | Unauthenticated users with device tracking | Sign in with Google OAuth |
-| Free | 5 requests | Authenticated users without subscription | Upgrade to paid plan |
-| Paid | 100 requests | Subscribed users | Contact support for higher limits |
-| Admin | Unlimited | Administrative access | Manual database update |
+**Key Principle**: 1 credit = 1 image generation request via Gemini API
+- Single-image generation: 1 credit
+- Multi-angle generation (4 images): 4 credits
 
-## Rate Limit Messages
+## User Types & Credit Allocations
 
-When users exceed their rate limits, they receive tier-specific messages:
+| User Type | Credit Allocation | Tracking Method | Reset Period |
+|-----------|------------------|-----------------|--------------|
+| Guest (No sign-in) | 1 credit lifetime | Device ID / IP Address | Never (lifetime limit) |
+| Signed-in (Free) | 4 credits lifetime | User ID (OAuth) | Never (lifetime limit) |
+| Paid Subscriber | 168 credits/month | User ID + Subscription | Monthly on billing date |
+| Credit Bundle User | Varies by bundle | User ID | Never (added to balance) |
 
-- **Guest**: "You've hit the maximum of 3 requests. Sign in to increase your limits."
-- **Free User**: "You've hit your daily limit of 5 requests. Upgrade to a paid plan for more requests."
-- **Paid User**: "You've hit your daily limit of 100 requests. Contact support if you need higher limits."
+## Technical Implementation
 
-## Setting Admin Access
+### Credit Tracking
+- **Storage**: DynamoDB RateLimitsTable
+- **Keys**: 
+  - Guest: `deviceID/IP + "guest-credits"`
+  - Signed-in: `userId + "lifetime-credits"`
+  - Subscriber: `userId + "monthly-credits"` (TTL: 30 days)
+  - Bundles: Added directly to user's credit balance
 
-To grant yourself admin access after signing in with Google OAuth:
+### Device Tracking (iOS)
+Guest users are tracked to prevent abuse:
+- Primary: `UIDevice.current.identifierForVendor`
+- Secondary: IDFA (with App Tracking Transparency consent)
+- Fallback: IP address from API Gateway headers
 
-1. Sign in to the app with your Google account
-2. Note your user ID from the JWT token or DynamoDB Users table
-3. Run the update script:
+### API Flow
+1. User initiates generation request
+2. GeminiProxyFunction checks available credits
+3. If sufficient: Deduct credits → Process request
+4. If insufficient: Return 429 error with upgrade prompt
+
+### Response Headers
+```
+X-Credits-Limit: 168
+X-Credits-Remaining: 165
+X-Credits-Reset: 1704067200 (for subscribers only)
+```
+
+### Error Response (429 Status)
+```json
+{
+  "error": {
+    "code": "insufficient_credits",
+    "message": "You need 4 credits for this generation. You have 2 credits remaining."
+  },
+  "credits": {
+    "required": 4,
+    "available": 2,
+    "userType": "free"
+  },
+  "upgrade_options": {
+    "subscription": {
+      "credits_per_month": 168,
+      "price": "$9.99/month"
+    },
+    "bundles": [
+      {
+        "credits": 8,
+        "price": "$0.99"
+      },
+      {
+        "credits": 48,
+        "price": "$4.99"
+      }
+    ]
+  }
+}
+```
+
+## Setting Admin Access (Development Only)
+
+For development and testing, admin access provides unlimited credits:
 
 ```bash
 cd backend/scripts
 
-# Update by email (easiest)
+# Update by email
 go run update-user-tier.go -email your-email@gmail.com -tier admin
 
 # Or update by user ID
@@ -40,51 +94,22 @@ go run update-user-tier.go -user google_12345 -tier admin
 go run update-user-tier.go -email your-email@gmail.com -tier admin -profile your-aws-profile
 ```
 
-## Rate Limit Implementation Details
+## Global Rate Limits
 
-### Guest Users
-- Tracked by composite key: SHA256(IP + Device ID)
-- Requires X-Device-ID header from iOS app
-- Additional IP-based tracking to prevent token rotation abuse
+Beyond credits, API Gateway enforces global limits to prevent abuse:
+- **Daily Quota**: 100,000 requests/day
+- **Burst Rate**: 60 requests/second
+- **Implementation**: AWS API Gateway Usage Plans
 
-### Authenticated Users
-- Tracked by user ID from JWT
-- Tier determined from JWT claims or database lookup
-- Support for free, paid, and admin tiers
+## Monitoring & Alerts
 
-### Technical Details
-- Window: 24-hour rolling window
-- Storage: DynamoDB with TTL
-- Headers: Returns X-RateLimit-* headers
-- Reset: Daily at midnight UTC
+- **CloudWatch Alarms**: Trigger on unusual usage patterns (>10 generations/day/user)
+- **Cost Tracking**: Monitor via AWS Cost Explorer
+- **Abuse Detection**: Track multiple account creation from same device/IP
 
-## API Response Headers
+## Credit Expiration Policy
 
-All API responses include rate limit information:
-
-```
-X-RateLimit-Limit: 100
-X-RateLimit-Remaining: 95
-X-RateLimit-Reset: 1704067200
-Retry-After: 3600 (only on 429 responses)
-```
-
-## Error Response Format
-
-When rate limit is exceeded (429 status):
-
-```json
-{
-  "error": {
-    "code": "rate_limit_exceeded",
-    "message": "You've hit your daily limit of 5 requests. Upgrade to a paid plan for more requests."
-  },
-  "rateLimit": {
-    "limit": 5,
-    "remaining": 0,
-    "resetsAt": "2024-01-01T00:00:00Z",
-    "retryAfter": 3600,
-    "userTier": "free"
-  }
-}
-```
+- **Guest/Free Credits**: Never expire (lifetime allocation)
+- **Subscription Credits**: Reset monthly, unused credits don't roll over
+- **Bundle Credits**: No expiration (permanent addition to balance)
+- **Account Inactivity**: Credits may expire after 1 year of inactivity (per App Store guidelines)

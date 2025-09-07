@@ -14,6 +14,38 @@ Key goals:
 - Dynamic hairstyle template library fetched from DynamoDB for easy maintenance without app redeploys
 - Scalable storage of hairstyle template assets (e.g., reference images) in S3 for dynamic, visual library enhancements
 
+## Monetization & Credit System
+
+The app uses a **credit-based monetization model** where all features are accessible to all users, with differences only in credit allocations. This ensures a fair and transparent pricing model while maintaining profitability at small scale.
+
+### Credit Economics
+- **1 credit = 1 image generation** via Gemini API
+- **Single-image generation**: 1 credit
+- **Multi-angle generation**: 4 credits (4 separate API calls)
+
+### User Tiers & Allocations
+| User Type | Credits | Reset Period | Purpose |
+|-----------|---------|--------------|----------|
+| Guest | 1 lifetime | Never | Trial experience |
+| Free (Signed-in) | 4 lifetime | Never | Test multi-angle feature |
+| Premium Subscriber | 168/month | Monthly | ~1-2 generations/day |
+| Bundle Purchaser | 8 or 48 | Never | On-demand usage |
+
+### Pricing Structure
+- **Monthly Subscription**: $9.99 (168 credits)
+- **Small Bundle**: $0.99 (8 credits)
+- **Large Bundle**: $4.99 (48 credits)
+
+### Platform Fees & Profitability
+- iOS: 30% starting, 15% after Small Business Program qualification
+- Android: 15% from day one
+- Break-even at 10+ users with average usage
+- 50-60% margins on credit bundles
+
+For detailed financial projections and implementation details, see:
+- [RATE_LIMITING.md](./RATE_LIMITING.md) - Technical credit system implementation
+- [MONEYMONEYMONEY.md](./MONEYMONEYMONEY.md) - Complete monetization strategy
+
 ## Functional Requirements
 1. **User Onboarding and Authentication**:
     - Sign up/login with Google or X using platform-specific web authentication (ASWebAuthenticationSession for iOS, Chrome Custom Tabs or WebView for Android)
@@ -25,6 +57,11 @@ Key goals:
       - After capture, allow a preview modal with option to keep or retake; if keep selected, the image will be added to the device's photo library
     - Upload from photo library using platform-specific pickers (Photos framework for iOS, MediaStore or Document Picker for Android)
 3. **Haircut Try-On**:
+    - **Credit Requirements**:
+      - Single-image generation: 1 credit (available to all users)
+      - Multi-angle generation: 4 credits (requires sufficient balance)
+      - Pre-flight validation ensures sufficient credits before starting
+      - Multi-angle generations complete even if limit reached mid-process
     - Three main input methods leveraging Gemini 2.5 Flash Image's multimodal capabilities:
       - **Text description**: Direct prompt with automatic face preservation (e.g., "Transform to a short bob with red highlights while preserving facial identity")
       - **Source image**: Upload reference photo - Gemini supports character consistency across celebrity photos, anime characters, or any hairstyle reference
@@ -62,7 +99,6 @@ Key goals:
       - Real-time preview updates as variations generate
     - **Generation Options**:
       - **Single Image Mode**: One optimized result (default)
-      - **Variation Mode**: Generate 2-4 variations with subtle differences
       - **Multi-Angle Mode**: Request specific views in prompt:
         ```swift
         // iOS Example
@@ -89,12 +125,36 @@ Key goals:
 6. **Analytics and Feedback**:
     - Anonymous usage tracking
     - Feedback form for improvements
+7. **Profile & Credit Management**:
+    - **Credit Balance Display**: Real-time credit count with visual indicator
+    - **Subscription Status**: Badge showing Free/Premium tier
+    - **Usage History**: Detailed view of past generations with credit costs
+    - **Purchase Interface**: In-app purchase overlay for subscriptions/bundles
+    - **Monthly Limit Alerts**: Visual notification when approaching/reaching limits
+    - **Upgrade Prompts**: Contextual CTAs when credits insufficient
 
 ## Look and Feel
 The app adopts a dark mode theme throughout, featuring a minimalistic design with subtle character to engage users without overwhelming them. Inspired by sleek designs from xAI, Tesla, and Apple. The overall aesthetic is clean, modern, and classy, using mostly white text and accents on a black background for high contrast and readability.
 - **Auth Entry Screen**: A fun, interactive 3D animation greets users on the onboarding screen for sign-in or guest mode. We leverage SceneKit for iOS and Filament for Android for 3D rendering.
   The shears can rotate based on touch gestures, with interaction similar to a trackball or spinning a globe, using platform-specific gesture recognizers. Upon selecting to proceed, they animate a cutting motion and fly off screen with physics-based animation using SCNAction (iOS) or Filament's animation APIs (Android).
 - **General UI Elements**: Minimalist layouts with ample negative space, rounded corners, and subtle shadows for depth. Transitions between screens use platform-specific transitions for smooth fades or slides. Interactive elements like buttons and sliders have micro-animations (e.g., scale on tap) using SwiftUI .animation modifiers (iOS) or Compose Animations (Android) to add character while maintaining fast response times.
+- **Profile & Credits UI**:
+  - **Credit Balance Widget**: Animated circular progress indicator showing remaining credits
+    - Color-coded: Green (>50%), Yellow (20-50%), Red (<20%)
+    - Tappable for detailed usage breakdown
+  - **Subscription Badge**: Premium users get gold badge with crown icon
+    - Free users see subtle "Upgrade" CTA
+  - **Purchase Button**: Shiny, animated gradient button in top-right of profile
+    - Pulses subtly when credits low
+  - **Usage History View**:
+    - Timeline layout with thumbnail previews
+    - Shows date, prompt summary, credit cost, and remaining balance
+    - Swipe-to-delete for history management
+  - **Purchase Overlay**:
+    - Full-screen modal with blur background
+    - Clear pricing tiers with benefit highlights
+    - Native payment sheet integration (StoreKit 2 for iOS, Google Play Billing for Android)
+    - Success animation on purchase completion
 
 
 
@@ -347,7 +407,12 @@ func handleGeminiEdit(ctx context.Context, request events.APIGatewayProxyRequest
 ## API Endpoints (AWS API Gateway)
 The backend exposes a minimal REST API for frontend integration. All endpoints use HTTPS and optional Cognito auth.
 ### **POST /api/gemini-edit**
-Proxies requests to Gemini 2.5 Flash Image API with security and rate limiting.
+Proxies requests to Gemini 2.5 Flash Image API with security, rate limiting, and credit validation.
+
+**Credit Validation**:
+- Pre-flight check ensures sufficient credits (1 for single, 4 for multi-angle)
+- Deducts credits atomically before processing
+- Returns clear error if insufficient credits
 **Request Format**:
 ```json
 {
@@ -392,10 +457,32 @@ Proxies requests to Gemini 2.5 Flash Image API with security and rate limiting.
 ```
 **Error Responses**:
 - `400`: Invalid request format or unsupported image type
+- `402`: Insufficient credits (includes upgrade options)
 - `413`: Image too large (max 20MB after base64 encoding)
 - `429`: Rate limit exceeded (implement exponential backoff)
 - `500`: Gemini API error or Lambda timeout
 - `503`: Service temporarily unavailable
+
+**402 Error Format**:
+```json
+{
+  "error": {
+    "code": "insufficient_credits",
+    "message": "You need 4 credits for multi-angle generation. You have 2 credits."
+  },
+  "credits": {
+    "required": 4,
+    "available": 2
+  },
+  "upgrade_options": {
+    "subscription": { "credits": 168, "price": "$9.99/month" },
+    "bundles": [
+      { "credits": 8, "price": "$0.99" },
+      { "credits": 48, "price": "$4.99" }
+    ]
+  }
+}
+```
 ### **GET /api/hairstyles**
 Fetches hairstyle template library with optimized prompts and reference images.
 **Query Parameters**:
@@ -421,6 +508,64 @@ Fetches hairstyle template library with optimized prompts and reference images.
   "nextOffset": 50
 }
 ```
+### **GET /api/user/credits**
+Fetches user's current credit balance and subscription status.
+
+**Response Format**:
+```json
+{
+  "userId": "google_12345",
+  "credits": {
+    "available": 42,
+    "monthlyLimit": 168,
+    "resetDate": "2025-02-01T00:00:00Z"
+  },
+  "subscription": {
+    "tier": "premium",
+    "status": "active",
+    "expiresAt": "2025-02-01T00:00:00Z"
+  },
+  "bundles": {
+    "purchased": 48,
+    "remaining": 12
+  }
+}
+```
+
+### **POST /api/purchase**
+Handles in-app purchase verification and credit allocation.
+
+**Request Format**:
+```json
+{
+  "receipt": "base64_encoded_receipt",
+  "productId": "com.ilikeyacut.subscription.monthly",
+  "platform": "ios" // or "android"
+}
+```
+
+### **GET /api/usage-history**
+Retrieves user's generation history with credit costs.
+
+**Response Format**:
+```json
+{
+  "history": [
+    {
+      "id": "gen_12345",
+      "timestamp": "2025-01-15T10:30:00Z",
+      "prompt": "Classic bob cut with highlights",
+      "creditCost": 4,
+      "type": "multi-angle",
+      "thumbnailUrl": "signed_s3_url",
+      "balanceAfter": 164
+    }
+  ],
+  "totalCreditsUsed": 127,
+  "currentPeriod": "2025-01"
+}
+```
+
 ### **POST /api/feedback**
 Collects user feedback on generated results for model improvement.
 **Request Format**:
@@ -461,28 +606,48 @@ Strict-Transport-Security: max-age=31536000; includeSubDomains
 
 ## Key Implementation Files
 ### iOS Core Files
-- **src/services/GeminiAIService.swift**: Handles calls to backend /gemini-edit endpoint
+- **src/services/GeminiAIService.swift**: Handles calls to backend /gemini-edit endpoint with credit validation
 - **src/services/HairstyleService.swift**: Fetches templates including S3 signed URLs; use SwiftUI AsyncImage for lazy-loading assets
 - **src/services/ImageProcessor.swift**: UIGraphics-based image resizing and optimization
+- **src/services/CreditManager.swift**: Manages credit balance, validation, and purchase flows
+- **src/services/StoreKitManager.swift**: Handles StoreKit 2 integration for IAP
 - **src/hooks/useCamera.swift**: Camera access using AVCaptureSession
-- **src/hooks/useGeminiEdit.swift**: AI processing with queue management
+- **src/hooks/useGeminiEdit.swift**: AI processing with queue management and credit checks
+- **src/hooks/useCredits.swift**: Observable credit state management
 - **src/components/CameraView.swift**: Camera preview view
 - **src/components/HairstyleGallery.swift**: Template library using List view with S3-hosted thumbnails
-- **src/pages/EditScreen.swift**: Main editing interface
+- **src/components/CreditBalanceWidget.swift**: Animated credit display component
+- **src/components/SubscriptionBadge.swift**: Premium/Free tier indicator
+- **src/components/UsageHistoryView.swift**: Generation history with credit costs
+- **src/components/PurchaseOverlay.swift**: Full-screen purchase interface
+- **src/pages/EditScreen.swift**: Main editing interface with credit validation
+- **src/pages/ProfileScreen.swift**: User profile with credit management
 ### Android Core Files
-- **src/services/GeminiAIService.kt**: Handles calls to backend /gemini-edit endpoint
+- **src/services/GeminiAIService.kt**: Handles calls to backend /gemini-edit endpoint with credit validation
 - **src/services/HairstyleService.kt**: Fetches templates including S3 signed URLs; use Coil or Glide for lazy-loading assets
 - **src/services/ImageProcessor.kt**: Bitmap-based image resizing and optimization
+- **src/services/CreditManager.kt**: Manages credit balance, validation, and purchase flows
+- **src/services/BillingManager.kt**: Handles Google Play Billing integration
 - **src/hooks/UseCamera.kt**: Camera access using CameraX
-- **src/hooks/UseGeminiEdit.kt**: AI processing with coroutine management
+- **src/hooks/UseGeminiEdit.kt**: AI processing with coroutine management and credit checks
+- **src/hooks/UseCredits.kt**: Credit state management with Flow
 - **src/components/CameraView.kt**: Camera preview composable
 - **src/components/HairstyleGallery.kt**: Template library using LazyColumn with S3-hosted thumbnails
-- **src/pages/EditScreen.kt**: Main editing interface
+- **src/components/CreditBalanceWidget.kt**: Animated credit display composable
+- **src/components/SubscriptionBadge.kt**: Premium/Free tier indicator
+- **src/components/UsageHistoryView.kt**: Generation history with credit costs
+- **src/components/PurchaseOverlay.kt**: Full-screen purchase interface
+- **src/pages/EditScreen.kt**: Main editing interface with credit validation
+- **src/pages/ProfileScreen.kt**: User profile with credit management
 ### Backend Go Files (AWS Lambda)
-- **lambda/gemini-proxy/main.go**: Go handler for /gemini-edit: Parses request, adds Gemini key (from env), forwards to Google API, returns image
-- **lambda/hairstyles/main.go**: Go handler for /hairstyles: Queries DynamoDB 'HairstyleTemplates' table, generates S3 signed URLs for assets, and includes them in the JSON response
-- **lambda/s3-uploader/main.go** (optional): Admin endpoint for uploading template assets to S3, if needed
-- **sam.yaml**: AWS SAM template defining Lambdas, API Gateway routes, DynamoDB table, S3 bucket, and IAM roles with least-privilege access
+- **lambda/gemini-proxy/main.go**: Go handler for /gemini-edit: Validates credits, deducts atomically, forwards to Gemini API
+- **lambda/hairstyles/main.go**: Go handler for /hairstyles: Queries DynamoDB 'HairstyleTemplates' table, generates S3 signed URLs for assets
+- **lambda/credit-validator/main.go**: Validates and deducts user credits with atomic DynamoDB operations
+- **lambda/purchase-handler/main.go**: Verifies IAP receipts with Apple/Google, allocates credits
+- **lambda/usage-history/main.go**: Fetches user generation history from DynamoDB
+- **lambda/user-credits/main.go**: Returns current credit balance and subscription status
+- **lambda/s3-uploader/main.go** (optional): Admin endpoint for uploading template assets to S3
+- **sam.yaml**: AWS SAM template defining Lambdas, API Gateway routes, DynamoDB tables (Users, Credits, History), S3 bucket, and IAM roles
 
 ## Mobile Optimizations
 ### Performance Patterns
