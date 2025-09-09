@@ -13,5 +13,5 @@ Native mobile app monorepo for trying on different hairstyles via Gemini's nano-
    - [rate limiting](docs/RATE_LIMITING.md)
 
 ### Making of
-Vibe code timelapse and initial demo: https://www.youtube.com/watch?v=jkfCZ3o19Fc
-![Demo GIF](docs/demo1.gif)
+[Vibe code timelapse and initial demo](https://www.youtube.com/watch?v=jkfCZ3o19Fc)
+![Demo GIF](docs/assets/demo1.gif)
